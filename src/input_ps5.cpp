@@ -77,6 +77,7 @@
 #include <gfx/video_defines.h>
 
 #include <input/input_driver.h>
+#include <input/input_keymaps.h>
 #include "content.h"
 #include "webui_update.h"
 #include "webui_link.h"
@@ -128,6 +129,15 @@ extern "C"
      * Values per ../ps5-native-gamepad-input-research's FEATURES.md, validated
      * on hardware. */
     std::int32_t scePadSetVibrationMode(std::int32_t handle, std::int32_t mode);
+    /* USB/Bluetooth keyboard service. The PS5 SDK ships PRX stubs but this
+     * payload does not ship the Sony headers; the report below follows the
+     * PS5 SDL backend's 96-byte read-state layout. */
+    std::int32_t sceSysmoduleLoadModule(std::uint16_t module_id);
+    std::int32_t sceKeyboardInit();
+    std::int32_t sceKeyboardOpen(std::int32_t user_id, std::int32_t type, std::int32_t index,
+                                 const void *params);
+    std::int32_t sceKeyboardReadState(std::int32_t handle, void *state);
+    std::int32_t sceKeyboardClose(std::int32_t handle);
     std::int32_t sceUserServiceInitialize(const void *params);
     std::int32_t sceUserServiceGetInitialUser(std::int32_t *user_id);
     /* The signed-in users, at most four; unused entries are -1 (the shape
@@ -208,8 +218,29 @@ static_assert(offsetof(PadSample, touches) == 0x3c, "touch contacts sit at 0x3c"
 static_assert(offsetof(PadSample, connected) == 0x4c, "connection state sits at 0x4c");
 static_assert(offsetof(PadSample, timestamp_us) == 0x50, "the timestamp sits at 0x50");
 
+/* sceKeyboardReadState's report, as the PS5 SDL backend reads it. */
+struct KeyboardSample
+{
+    std::uint64_t timestamp_us;
+    std::uint8_t intercepted;
+    std::uint8_t reserved0[7];
+    std::uint8_t connected;
+    std::uint8_t reserved1[3];
+    std::int32_t length;
+    std::uint32_t leds;
+    std::uint32_t modifiers;
+    std::uint16_t keycodes[16];
+    std::uint8_t reserved2[32];
+};
+
+static_assert(sizeof(KeyboardSample) == 96, "keyboard reports are 96 bytes");
+static_assert(offsetof(KeyboardSample, connected) == 0x10, "keyboard connection state is at 0x10");
+static_assert(offsetof(KeyboardSample, modifiers) == 0x1c, "keyboard modifiers are at 0x1c");
+static_assert(offsetof(KeyboardSample, keycodes) == 0x20, "keyboard usages are at 0x20");
+
 /* One read returns a batch of the samples taken since the last one. */
 constexpr int sample_capacity = 64;
+constexpr std::uint16_t keyboard_sysmodule_id = 0x0106;
 constexpr std::int32_t pad_open_attempts = 10;
 constexpr std::uint32_t pad_open_retry_microseconds = 100000;
 /* A console signs in at most four users, each with one controller. */
@@ -290,6 +321,11 @@ struct PadState
 
 /* The controller on each port, or null. */
 PadState *pads[max_pads] = {};
+/* The keyboard service is owned by the title input driver. */
+std::int32_t keyboard_handle = -1;
+std::uint16_t keyboard_previous[24] = {};
+unsigned keyboard_previous_count = 0;
+std::int32_t keyboard_last_read_error = 0;
 /* The joypad driver's handle for RetroArch: the driver stays registered with no
  * controller at all, and reports nothing until one comes. */
 int joypad_cookie;
@@ -949,6 +985,206 @@ void *joypad_init(void *) noexcept
     return &joypad_cookie;
 }
 
+unsigned keyboard_retro_key(std::uint16_t usage) noexcept
+{
+    if (usage >= 0x04 && usage <= 0x1d)
+        return RETROK_a + usage - 0x04;
+    if (usage >= 0x1e && usage <= 0x26)
+        return RETROK_1 + usage - 0x1e;
+    if (usage >= 0x3a && usage <= 0x45)
+        return RETROK_F1 + usage - 0x3a;
+    if (usage >= 0x59 && usage <= 0x61)
+        return RETROK_KP1 + usage - 0x59;
+
+    switch (usage)
+    {
+    case 0x27: return RETROK_0;
+    case 0x28: return RETROK_RETURN;
+    case 0x29: return RETROK_ESCAPE;
+    case 0x2a: return RETROK_BACKSPACE;
+    case 0x2b: return RETROK_TAB;
+    case 0x2c: return RETROK_SPACE;
+    case 0x2d: return RETROK_MINUS;
+    case 0x2e: return RETROK_EQUALS;
+    case 0x2f: return RETROK_LEFTBRACKET;
+    case 0x30: return RETROK_RIGHTBRACKET;
+    case 0x31:
+    case 0x32:
+    case 0x64: return RETROK_BACKSLASH;
+    case 0x33: return RETROK_SEMICOLON;
+    case 0x34: return RETROK_QUOTE;
+    case 0x35: return RETROK_BACKQUOTE;
+    case 0x36: return RETROK_COMMA;
+    case 0x37: return RETROK_PERIOD;
+    case 0x38: return RETROK_SLASH;
+    case 0x39: return RETROK_CAPSLOCK;
+    case 0x46: return RETROK_PRINT;
+    case 0x47: return RETROK_SCROLLOCK;
+    case 0x48: return RETROK_PAUSE;
+    case 0x49: return RETROK_INSERT;
+    case 0x4a: return RETROK_HOME;
+    case 0x4b: return RETROK_PAGEUP;
+    case 0x4c: return RETROK_DELETE;
+    case 0x4d: return RETROK_END;
+    case 0x4e: return RETROK_PAGEDOWN;
+    case 0x4f: return RETROK_RIGHT;
+    case 0x50: return RETROK_LEFT;
+    case 0x51: return RETROK_DOWN;
+    case 0x52: return RETROK_UP;
+    case 0x53: return RETROK_NUMLOCK;
+    case 0x54: return RETROK_KP_DIVIDE;
+    case 0x55: return RETROK_KP_MULTIPLY;
+    case 0x56: return RETROK_KP_MINUS;
+    case 0x57: return RETROK_KP_PLUS;
+    case 0x58: return RETROK_KP_ENTER;
+    case 0x62: return RETROK_KP0;
+    case 0x63: return RETROK_KP_PERIOD;
+    case 0x65: return RETROK_MENU;
+    case 0x66: return RETROK_POWER;
+    case 0xe0: return RETROK_LCTRL;
+    case 0xe1: return RETROK_LSHIFT;
+    case 0xe2: return RETROK_LALT;
+    case 0xe3: return RETROK_LSUPER;
+    case 0xe4: return RETROK_RCTRL;
+    case 0xe5: return RETROK_RSHIFT;
+    case 0xe6: return RETROK_RALT;
+    case 0xe7: return RETROK_RSUPER;
+    default: return RETROK_UNKNOWN;
+    }
+}
+
+std::uint16_t keyboard_retro_modifiers(std::uint32_t modifiers) noexcept
+{
+    std::uint16_t result = RETROKMOD_NONE;
+    if (modifiers & 0x22)
+        result |= RETROKMOD_SHIFT;
+    if (modifiers & 0x11)
+        result |= RETROKMOD_CTRL;
+    if (modifiers & 0x44)
+        result |= RETROKMOD_ALT;
+    if (modifiers & 0x88)
+        result |= RETROKMOD_META;
+    return result;
+}
+
+bool keyboard_has_key(const std::uint16_t *keys, unsigned count, std::uint16_t key) noexcept
+{
+    for (unsigned i = 0; i < count; ++i)
+        if (keys[i] == key)
+            return true;
+    return false;
+}
+
+void keyboard_send(std::uint16_t key, bool down, std::uint16_t modifiers) noexcept
+{
+    const auto code = keyboard_retro_key(key);
+    if (code == RETROK_UNKNOWN)
+        return;
+    const auto character = input_keymaps_translate_rk_to_ascii(
+        static_cast<retro_key>(code), static_cast<retro_mod>(modifiers));
+    input_keyboard_event(down, code, character, modifiers, 0);
+}
+
+void keyboard_update(const KeyboardSample *sample) noexcept
+{
+    std::uint16_t current[24] = {};
+    unsigned current_count = 0;
+    std::uint32_t raw_modifiers = sample != nullptr ? sample->modifiers : 0;
+    auto modifiers = keyboard_retro_modifiers(raw_modifiers);
+
+    if (sample != nullptr && sample->connected && !sample->intercepted)
+    {
+        /* HID 1..3 means rollover/error: the list is incomplete, so keep the
+         * prior state until a complete report arrives instead of releasing keys. */
+        for (const auto usage : sample->keycodes)
+            if (usage >= 1 && usage <= 3)
+                return;
+        if (sample->leds & 0x01)
+            modifiers |= RETROKMOD_NUMLOCK;
+        if (sample->leds & 0x02)
+            modifiers |= RETROKMOD_CAPSLOCK;
+        if (sample->leds & 0x04)
+            modifiers |= RETROKMOD_SCROLLOCK;
+        for (std::uint16_t usage = 0xe0; usage <= 0xe7; ++usage)
+            if (raw_modifiers & (UINT32_C(1) << (usage - 0xe0)))
+                current[current_count++] = usage;
+        for (const auto usage : sample->keycodes)
+        {
+            if (usage < 0x04 || usage > 0xdf || keyboard_has_key(current, current_count, usage))
+                continue; // 0..3 are the HID rollover/error codes.
+            current[current_count++] = usage;
+        }
+    }
+
+    for (unsigned i = 0; i < keyboard_previous_count; ++i)
+        if (!keyboard_has_key(current, current_count, keyboard_previous[i]))
+            keyboard_send(keyboard_previous[i], false, modifiers);
+    for (unsigned i = 0; i < current_count; ++i)
+        if (!keyboard_has_key(keyboard_previous, keyboard_previous_count, current[i]))
+            keyboard_send(current[i], true, modifiers);
+
+    std::memcpy(keyboard_previous, current, current_count * sizeof(current[0]));
+    keyboard_previous_count = current_count;
+}
+
+void keyboard_open() noexcept
+{
+    if (keyboard_handle >= 0)
+        return;
+    if (!joypad_ready)
+        (void)joypad_init(nullptr);
+
+    std::int32_t user_id = pads[0] != nullptr ? pads[0]->user_id : -1;
+    if (user_id < 0 && sceUserServiceGetInitialUser(&user_id) < 0)
+    {
+        ps5_input_trace("input: keyboard unavailable; no signed-in user");
+        return;
+    }
+
+    const auto module_result = sceSysmoduleLoadModule(keyboard_sysmodule_id);
+    const auto init_result = sceKeyboardInit();
+    alignas(8) std::uint8_t params[16] = {};
+    keyboard_handle = sceKeyboardOpen(user_id, 0, 0, params);
+    char line[144];
+    std::snprintf(line, sizeof(line), "input: keyboard module=%#x init=%#x open=%#x user=%d",
+                  static_cast<unsigned>(module_result), static_cast<unsigned>(init_result),
+                  static_cast<unsigned>(keyboard_handle), user_id);
+    ps5_input_trace(line);
+}
+
+void keyboard_poll() noexcept
+{
+    if (keyboard_handle < 0)
+        return;
+    KeyboardSample sample{};
+    const auto result = sceKeyboardReadState(keyboard_handle, &sample);
+    if (result != 0)
+    {
+        if (result != keyboard_last_read_error)
+        {
+            char line[96];
+            std::snprintf(line, sizeof(line), "input: sceKeyboardReadState failed (%#x)",
+                          static_cast<unsigned>(result));
+            ps5_input_trace(line);
+            keyboard_last_read_error = result;
+        }
+        keyboard_update(nullptr); // Drop held keys on a read error.
+        return;
+    }
+    keyboard_last_read_error = 0;
+    keyboard_update(&sample);
+}
+
+void keyboard_close() noexcept
+{
+    if (keyboard_handle >= 0)
+    {
+        keyboard_update(nullptr);
+        (void)sceKeyboardClose(keyboard_handle);
+        keyboard_handle = -1;
+    }
+}
+
 void joypad_destroy() noexcept
 {
     for (PadState *&state : pads)
@@ -1457,11 +1693,13 @@ bool update_exit_armed = false;
 void *ps5_input_init(const char *) noexcept
 {
     update_exit_armed = false;
+    keyboard_open();
     static int cookie;
     return &cookie;
 }
 void ps5_input_poll(void *) noexcept
 {
+    keyboard_poll();
     if (auto *pad = pad_at(0))
     {
         auto &touch = pad->touch;
@@ -1486,6 +1724,7 @@ void ps5_input_poll(void *) noexcept
 }
 void ps5_input_free(void *) noexcept
 {
+    keyboard_close();
 }
 
 std::int16_t ps5_input_state(void *, const input_device_driver_t *, const input_device_driver_t *,
@@ -1512,7 +1751,7 @@ std::uint64_t ps5_input_capabilities(void *data) noexcept
 {
     (void)data;
     return (UINT64_C(1) << RETRO_DEVICE_JOYPAD) | (UINT64_C(1) << RETRO_DEVICE_ANALOG) |
-           (UINT64_C(1) << RETRO_DEVICE_MOUSE);
+           (UINT64_C(1) << RETRO_DEVICE_MOUSE) | (UINT64_C(1) << RETRO_DEVICE_KEYBOARD);
 }
 } // namespace
 
@@ -1630,3 +1869,4 @@ extern "C" void ps5_input_note_new_frame(void)
     new_frame_last_ns = now;
     new_frames.fetch_add(1, std::memory_order_relaxed);
 }
+
