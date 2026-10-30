@@ -510,8 +510,8 @@ extern "C" int ps5_esde_write_library_to(const struct ps5_esde_library_paths *pa
                     split_list = std::make_unique<pugi::xml_document>();
                     split_list->load_file(
                         (data + "/gamelists/" + split->second + "/gamelist.xml").c_str());
+                    remember_games(split_list->child("gameList"));
                 }
-                remember_games(split_list->child("gameList"));
             }
         remember_games(previous.child("gameList"));
         remember_games(legacy.child("gameList"));
