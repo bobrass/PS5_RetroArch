@@ -351,7 +351,11 @@ extern "C" int ps5_esde_write_library_to(const struct ps5_esde_library_paths *pa
         entry.append_child("fullname")
             .text()
             .set(known != reference.end() ? known->second.fullname.c_str() : system.name);
-        entry.append_child("path").text().set(system.folder);
+        /* ES-DE's filesystem check collapses the double slash in an SMB URL and
+         * rejects the resulting system root (issue 92). With --gamelist-only this
+         * local root is not scanned; each SMB game below keeps its full URL. */
+        const bool smb_folder = std::string(system.folder).rfind("smb://", 0) == 0;
+        entry.append_child("path").text().set(smb_folder ? "/app0" : system.folder);
         entry.append_child("extension").text().set(extensions(system.extensions).c_str());
         const std::string command =
             system.core[0] ? std::string("/app0/eboot.bin -L ") + system.core + " %ROM%"
@@ -384,9 +388,11 @@ extern "C" int ps5_esde_write_library_to(const struct ps5_esde_library_paths *pa
         {
             const struct ps5_library_game &game = library.games[system.first_game + g];
             const std::string path = game.path;
-            const std::string relative =
-                "./" + (path.rfind(prefix, 0) == 0 ? path.substr(prefix.size())
-                                                   : path.substr(path.rfind('/') + 1));
+            const std::string relative = path.rfind("smb://", 0) == 0
+                                             ? path
+                                             : "./" + (path.rfind(prefix, 0) == 0
+                                                           ? path.substr(prefix.size())
+                                                           : path.substr(path.rfind('/') + 1));
             const auto previous_game = known_games.find(path);
             pugi::xml_node node;
             if (previous_game != known_games.end())
