@@ -42,6 +42,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <sys/stat.h>
@@ -58,7 +59,7 @@ struct Reference
 struct SystemView
 {
     const struct ps5_library_system *system;
-    std::string id, playlist;
+    std::string id, playlist, source_playlist;
     std::vector<const struct ps5_library_game *> games;
 };
 
@@ -404,17 +405,10 @@ extern "C" int ps5_esde_write_library_to(const struct ps5_esde_library_paths *pa
     std::set<std::string> names;
     size_t games_written = 0, games_kept = 0, failures = 0;
     std::vector<SystemView> views;
+    std::vector<SystemView> split_views;
     for (size_t s = 0; s < library.system_count; s++)
     {
         const struct ps5_library_system &system = library.systems[s];
-        if (!paths->separate_systems)
-        {
-            SystemView view{&system, system.id, "", {}};
-            for (size_t g = 0; g < system.game_count; g++)
-                view.games.push_back(&library.games[system.first_game + g]);
-            views.push_back(std::move(view));
-            continue;
-        }
         std::map<std::string, std::vector<const struct ps5_library_game *>> playlists;
         for (size_t g = 0; g < system.game_count; g++)
         {
@@ -427,15 +421,38 @@ extern "C" int ps5_esde_write_library_to(const struct ps5_esde_library_paths *pa
             const std::string id = playlist.first.empty()
                                        ? std::string(system.id)
                                        : std::string(system.id) + "-" + playlist_slug(label);
-            views.push_back({&system, id, label, playlist.second});
+            split_views.push_back({&system, id, label, playlist.first, playlist.second});
+        }
+        if (!paths->separate_systems)
+        {
+            SystemView view{&system, system.id, "", "", {}};
+            for (size_t g = 0; g < system.game_count; g++)
+                view.games.push_back(&library.games[system.first_game + g]);
+            views.push_back(std::move(view));
         }
     }
+    /* Retain exactly the names that separate mode uses so combined mode can
+     * carry gamelist details back from the playlist-specific files. */
+    std::map<std::pair<std::string, std::string>, std::string> split_names;
+    std::set<std::string> split_system_names;
+    for (SystemView &view : split_views)
+    {
+        std::string name = view.id;
+        for (int suffix = 2; split_system_names.count(name); suffix++)
+            name = view.id + "-" + std::to_string(suffix);
+        split_system_names.insert(name);
+        view.id = name;
+        split_names[{view.system->id, view.source_playlist}] = name;
+    }
+    if (paths->separate_systems)
+        views = std::move(split_views);
     for (const SystemView &view : views)
     {
         const struct ps5_library_system &system = *view.system;
         std::string name = view.id;
-        for (int suffix = 2; names.count(name); suffix++)
-            name = view.id + "-" + std::to_string(suffix);
+        if (!paths->separate_systems)
+            for (int suffix = 2; names.count(name); suffix++)
+                name = view.id + "-" + std::to_string(suffix);
         names.insert(name);
         const auto known = reference.find(system.id);
         pugi::xml_node entry = list.append_child("system");
@@ -480,6 +497,22 @@ extern "C" int ps5_esde_write_library_to(const struct ps5_esde_library_paths *pa
                     known_games[path] = game;
             }
         };
+        std::map<std::string, std::unique_ptr<pugi::xml_document>> split_lists;
+        if (!paths->separate_systems)
+            for (const struct ps5_library_game *game : view.games)
+            {
+                const auto split = split_names.find({system.id, game->playlist});
+                if (split == split_names.end())
+                    continue;
+                auto &split_list = split_lists[split->second];
+                if (!split_list)
+                {
+                    split_list = std::make_unique<pugi::xml_document>();
+                    split_list->load_file(
+                        (data + "/gamelists/" + split->second + "/gamelist.xml").c_str());
+                }
+                remember_games(split_list->child("gameList"));
+            }
         remember_games(previous.child("gameList"));
         remember_games(legacy.child("gameList"));
         pugi::xml_node root = games.append_child("gameList");
