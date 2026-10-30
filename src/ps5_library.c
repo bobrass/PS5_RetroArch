@@ -1092,8 +1092,9 @@ struct scanning
     size_t added;
 };
 
-/* A file is firmware when a core's info names it, a variant of one (panafz10-patched.bin
- * of panafz10.bin), or its name says so ([BIOS] ..., Kickstart ..., Lynx Boot Image). */
+/* A file is firmware when a core's info names its whole stem, or a named variant (for
+ * example panafz10-patched.bin of panafz10.bin), or its name says so ([BIOS] ..., Kickstart
+ * ..., Lynx Boot Image). A game whose title merely starts with a firmware stem is not one. */
 static int is_firmware(const struct scanning *scanning, const char *name)
 {
     char lower[512], stem[512];
@@ -1104,6 +1105,8 @@ static int is_firmware(const struct scanning *scanning, const char *name)
     if (strstr(lower, "bios") || strstr(lower, "kickstart") || strstr(lower, "boot image") ||
         strstr(lower, "boot rom"))
         return 1;
+    const char *extension = strrchr(lower, '.');
+    const size_t name_stem_length = extension ? (size_t)(extension - lower) : strlen(lower);
     for (const char *at = scanning->firmware; at && *at;)
     {
         const char *bar = strchr(at, '|');
@@ -1112,7 +1115,10 @@ static int is_firmware(const struct scanning *scanning, const char *name)
         char *dot = strrchr(stem, '.');
         if (dot && dot != stem)
             *dot = '\0';
-        if (stem[0] && strncmp(lower, stem, strlen(stem)) == 0)
+        const size_t stem_length = strlen(stem);
+        if (stem_length && name_stem_length >= stem_length &&
+            strncmp(lower, stem, stem_length) == 0 &&
+            (name_stem_length == stem_length || lower[stem_length] == '-'))
             return 1;
         at = bar ? bar + 1 : NULL;
     }
