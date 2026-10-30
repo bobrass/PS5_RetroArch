@@ -1,0 +1,15 @@
+diff --git a/es-core/src/utils/FileSystemUtil.cpp b/es-core/src/utils/FileSystemUtil.cpp
+--- a/es-core/src/utils/FileSystemUtil.cpp
++++ b/es-core/src/utils/FileSystemUtil.cpp
+@@ -431,6 +431,8 @@
+             // Convert '\\' to '/'
+             while ((offset = genericPath.find('\\')) != std::string::npos)
+                 genericPath.replace(offset, 1, "/");
+-            // Remove double '/'
+-            while ((offset = genericPath.find("//")) != std::string::npos)
+-                genericPath.erase(offset, 1);
++            // Remove double '/' from filesystem paths, not URI schemes.
++            if (genericPath.find("://") == std::string::npos) {
++                while ((offset = genericPath.find("//")) != std::string::npos)
++                    genericPath.erase(offset, 1);
++            }
