@@ -241,6 +241,7 @@ static_assert(offsetof(KeyboardSample, keycodes) == 0x20, "keyboard usages are a
 /* One read returns a batch of the samples taken since the last one. */
 constexpr int sample_capacity = 64;
 constexpr std::uint16_t keyboard_sysmodule_id = 0x0106;
+constexpr std::int32_t keyboard_slot_count = 12;
 constexpr std::int32_t pad_open_attempts = 10;
 constexpr std::uint32_t pad_open_retry_microseconds = 100000;
 /* A console signs in at most four users, each with one controller. */
@@ -1144,11 +1145,21 @@ void keyboard_open() noexcept
     const auto module_result = sceSysmoduleLoadModule(keyboard_sysmodule_id);
     const auto init_result = sceKeyboardInit();
     alignas(8) std::uint8_t params[16] = {};
-    keyboard_handle = sceKeyboardOpen(user_id, 0, 0, params);
-    char line[144];
-    std::snprintf(line, sizeof(line), "input: keyboard module=%#x init=%#x open=%#x user=%d",
+    std::int32_t opened_slot = -1;
+    for (std::int32_t slot = 0; slot < keyboard_slot_count; ++slot)
+    {
+        keyboard_handle = sceKeyboardOpen(user_id, 0, slot, params);
+        if (keyboard_handle >= 0)
+        {
+            opened_slot = slot;
+            break;
+        }
+    }
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "input: keyboard module=%#x init=%#x open=%#x slot=%d user=%d",
                   static_cast<unsigned>(module_result), static_cast<unsigned>(init_result),
-                  static_cast<unsigned>(keyboard_handle), user_id);
+                  static_cast<unsigned>(keyboard_handle), opened_slot, user_id);
     ps5_input_trace(line);
 }
 
@@ -1869,4 +1880,3 @@ extern "C" void ps5_input_note_new_frame(void)
     new_frame_last_ns = now;
     new_frames.fetch_add(1, std::memory_order_relaxed);
 }
-
